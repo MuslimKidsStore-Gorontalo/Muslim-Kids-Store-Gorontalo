@@ -1,6 +1,6 @@
 """
-POS Toko Kelontong AI — Telegram Bot
-Point of Sale lengkap untuk toko kelontong
+POS Toko Muslim Kids Store-Gorontalo — Telegram Bot
+Point of Sale lengkap untuk toko Muslim Kids Store-Gorontalo
 Powered by Google Gemini API (GRATIS)
 """
 
