@@ -280,7 +280,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
     await update.message.reply_text(
         f"🏪 Selamat datang *{name}*!\n\n"
-        "*POS Toko Kelontong AI* siap membantu.\n\n"
+        "*POS Toko Muslim Kids Store-Gorontalo* siap membantu.\n\n"
         "📌 *Menu Utama:*\n"
         "🛒 /jual — Catat penjualan\n"
         "📦 /produk — Kelola produk\n"
@@ -920,7 +920,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🏪 POS Bot berjalan dengan Gemini AI (GRATIS)...")
+    print("🏪 Muslim Kids Store-Gorontalo Bot berjalan...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
