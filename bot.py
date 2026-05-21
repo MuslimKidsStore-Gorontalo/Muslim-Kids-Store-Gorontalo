@@ -1,6 +1,6 @@
 """
-Toko Muslim Kids Store-Gorontalo — Telegram Bot
-Point of Sale lengkap untuk toko Muslim Kids Store-Gorontalo
+POS Toko Kelontong AI — Telegram Bot
+Point of Sale lengkap untuk toko kelontong
 Powered by Google Gemini API (GRATIS)
 """
 
@@ -269,22 +269,62 @@ def cart_summary(cart):
 
 # ── AI Helpers ────────────────────────────────────────────────────────────────
 def ai_parse_item(text, products):
-    """Parse teks jual menjadi item transaksi."""
-    product_list = "\n".join([f"- id:{p[0]} nama:{p[1]} harga:{p[3]} stok:{p[5]} satuan:{p[7]}" for p in products])
-    prompt = f"""Kamu kasir toko kelontong. Parse perintah penjualan berikut.
-Daftar produk tersedia:
-{product_list if product_list else '(belum ada produk)'}
+    """Parse teks jual menjadi item transaksi dengan fallback manual."""
+
+    # ── Fallback manual: coba cocokkan langsung tanpa AI ─────────────────
+    # Format: "nama produk angka" atau "angka nama produk"
+    import re
+    text_lower = text.lower().strip()
+
+    # Coba cocokkan dengan produk yang ada
+    for p in products:
+        nama = p[2].lower()
+        # Cek apakah nama produk ada di teks
+        if nama in text_lower or any(w in text_lower for w in nama.split()):
+            # Ambil angka dari teks
+            angka = re.findall(r'\d+', text)
+            qty = int(angka[0]) if angka else 1
+            return {
+                "found": True,
+                "items": [{"pid": p[0], "name": p[2], "price": p[3], "qty": qty}],
+                "message": "OK"
+            }
+
+    # ── Kalau manual gagal, coba via Gemini AI ────────────────────────────
+    product_list = "\n".join([
+        f"id:{p[0]}|nama:{p[2]}|harga:{p[3]}|stok:{p[5]}|satuan:{p[7]}"
+        for p in products
+    ])
+    prompt = f"""Kamu kasir toko. Parse perintah penjualan berikut.
+
+Produk tersedia:
+{product_list}
 
 Perintah: "{text}"
 
-Kembalikan HANYA JSON valid:
-{{"found": true/false, "items": [{{"pid": id_produk_atau_null, "name": "nama produk", "price": harga_jual, "qty": jumlah}}], "message": "pesan singkat"}}
+Aturan:
+- Cocokkan nama produk secara fleksibel (tidak harus persis sama)
+- Jika ada angka setelah nama produk, itu adalah qty
+- Jika tidak ada angka, qty = 1
 
-Jika produk tidak ada di daftar, tetap masukkan dengan pid:null dan price:0.
-Jika tidak ada perintah penjualan, found:false."""
-    resp = gemini.generate_content(prompt)
-    raw  = resp.text.replace("```json","").replace("```","").strip()
-    return json.loads(raw)
+Kembalikan HANYA JSON (tanpa markdown, tanpa penjelasan):
+{{"found":true,"items":[{{"pid":ID_PRODUK,"name":"NAMA","price":HARGA,"qty":JUMLAH}}],"message":"ok"}}
+
+Jika tidak ada produk yang cocok:
+{{"found":false,"items":[],"message":"Produk tidak ditemukan"}}"""
+
+    try:
+        resp = gemini.generate_content(prompt)
+        raw  = resp.text.strip()
+        # Bersihkan markdown jika ada
+        raw = re.sub(r'```json|```', '', raw).strip()
+        # Ambil JSON dari teks
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return json.loads(raw)
+    except Exception:
+        return {"found": False, "items": [], "message": "Gagal memproses"}
 
 def ai_parse_expense(text):
     """Parse teks pengeluaran."""
@@ -308,9 +348,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📊 /laporan — Laporan & omzet\n"
         "📉 /stok — Cek & update stok\n"
         "💸 /pengeluaran — Catat pengeluaran\n"
-        "💳 /setting\_pembayaran — Atur QRIS & Rekening\n"
+        "💳 /setting_pembayaran — Atur QRIS & Rekening\n"
         "📥 /export — Export data CSV\n"
-        "⚠️ /stok\_tipis — Alert stok menipis\n"
+        "⚠️ /stok_tipis — Alert stok menipis\n"
         "❓ /bantuan — Panduan lengkap",
         parse_mode="Markdown"
     )
@@ -319,7 +359,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── /bantuan ──────────────────────────────────────────────────────────────────
 async def cmd_bantuan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *Panduan POS Toko Muslim Kids Store-Gorontalo*\n\n"
+        "📖 *Panduan POS Toko Kelontong*\n\n"
         "*🛒 Penjualan:*\n"
         "Ketik `/jual` lalu masukkan item:\n"
         "`indomie goreng 3`\n"
@@ -1049,7 +1089,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             config = get_payment_config(owner)
             if not config["qris_number"]:
                 await query.edit_message_text(
-                    "⚠️ Info QRIS belum diset!\nGunakan /setting\_pembayaran untuk mengatur QRIS dulu.",
+                    "⚠️ Info QRIS belum diset!\nGunakan /setting_pembayaran untuk mengatur QRIS dulu.",
                     parse_mode="Markdown"
                 )
                 return
@@ -1068,7 +1108,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             config = get_payment_config(owner)
             if not config["bank_number"]:
                 await query.edit_message_text(
-                    "⚠️ Rekening belum diset!\nGunakan /setting\_pembayaran untuk mengatur rekening dulu.",
+                    "⚠️ Rekening belum diset!\nGunakan /setting_pembayaran untuk mengatur rekening dulu.",
                     parse_mode="Markdown"
                 )
                 return
