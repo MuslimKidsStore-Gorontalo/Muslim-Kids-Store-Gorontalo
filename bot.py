@@ -512,7 +512,20 @@ async def jual_bayar_tunai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(receipt, parse_mode="Markdown")
     return ConversationHandler.END
 
-async def jual_konfirm_transfer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def jual_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Router untuk state JUAL_PILIH_BAYAR — teruskan ke handler yang tepat."""
+    awaiting = ctx.user_data.get("awaiting")
+    if awaiting == "tunai":
+        return await jual_bayar_tunai(update, ctx)
+    elif awaiting == "nontunai":
+        return await jual_konfirm_transfer(update, ctx)
+    else:
+        # Masih nunggu pilih metode — abaikan teks
+        await update.message.reply_text(
+            "💳 Silakan pilih metode pembayaran dengan menekan tombol di atas.",
+            parse_mode="Markdown"
+        )
+        return JUAL_PILIH_BAYAR
     """Handler konfirmasi setelah transfer — user ketik 'sudah' atau nominal."""
     text  = update.message.text.strip().lower()
     owner = update.effective_user.id
@@ -1183,10 +1196,8 @@ def main():
     jual_conv = ConversationHandler(
         entry_points=[CommandHandler("jual", cmd_jual)],
         states={
-            JUAL_ITEM:            [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_item)],
-            JUAL_PILIH_BAYAR:     [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_item)],
-            JUAL_BAYAR_TUNAI:     [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_bayar_tunai)],
-            JUAL_KONFIRM_TRANSFER:[MessageHandler(filters.TEXT & ~filters.COMMAND, jual_konfirm_transfer)],
+            JUAL_ITEM:        [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_item)],
+            JUAL_PILIH_BAYAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_router)],
         },
         fallbacks=[
             CommandHandler("batal", jual_cancel),
