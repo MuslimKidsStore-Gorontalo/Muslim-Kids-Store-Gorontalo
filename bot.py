@@ -1188,7 +1188,11 @@ def main():
             JUAL_BAYAR_TUNAI:     [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_bayar_tunai)],
             JUAL_KONFIRM_TRANSFER:[MessageHandler(filters.TEXT & ~filters.COMMAND, jual_konfirm_transfer)],
         },
-        fallbacks=[CommandHandler("batal", jual_cancel)],
+        fallbacks=[
+            CommandHandler("batal", jual_cancel),
+            CommandHandler("start", cmd_start),
+        ],
+        allow_reentry=True,
     )
 
     # ConversationHandler: Setting Pembayaran
@@ -1198,7 +1202,11 @@ def main():
             SETTING_QRIS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, setting_qris_save)],
             SETTING_REKENING: [MessageHandler(filters.TEXT & ~filters.COMMAND, setting_rekening_save)],
         },
-        fallbacks=[CommandHandler("batal", jual_cancel)],
+        fallbacks=[
+            CommandHandler("batal", jual_cancel),
+            CommandHandler("start", cmd_start),
+        ],
+        allow_reentry=True,
     )
 
     # ConversationHandler: Tambah Produk
@@ -1214,7 +1222,11 @@ def main():
                 CallbackQueryHandler(produk_kategori_callback, pattern="^cat_"),
             ],
         },
-        fallbacks=[CommandHandler("batal", jual_cancel)],
+        fallbacks=[
+            CommandHandler("batal", jual_cancel),
+            CommandHandler("start", cmd_start),
+        ],
+        allow_reentry=True,
     )
 
     # ConversationHandler: Stok Masuk
@@ -1224,7 +1236,11 @@ def main():
             STOK_MASUK_PRODUK: [MessageHandler(filters.TEXT & ~filters.COMMAND, stok_masuk_produk)],
             STOK_MASUK_QTY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, stok_masuk_qty)],
         },
-        fallbacks=[CommandHandler("batal", jual_cancel)],
+        fallbacks=[
+            CommandHandler("batal", jual_cancel),
+            CommandHandler("start", cmd_start),
+        ],
+        allow_reentry=True,
     )
 
     app.add_handler(jual_conv)
