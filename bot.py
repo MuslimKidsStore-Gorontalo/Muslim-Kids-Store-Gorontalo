@@ -297,29 +297,69 @@ def cart_summary(cart):
 
 
 # ── AI Helpers ────────────────────────────────────────────────────────────────
-def ai_parse_item(text, products):
-    """Parse teks jual menjadi item transaksi dengan fallback manual."""
-
-    # ── Fallback manual: coba cocokkan langsung tanpa AI ─────────────────
-    # Format: "nama produk angka" atau "angka nama produk"
+def find_matching_products(text, products):
+    """
+    Cari semua produk yang namanya cocok dengan teks.
+    Return: (exact_match, similar_matches)
+    - exact_match  : 1 produk cocok persis → langsung pakai
+    - similar_matches : >1 produk mirip → perlu ditampilkan sebagai pilihan
+    """
     import re
     text_lower = text.lower().strip()
+    # Pisahkan kata kunci dari angka qty
+    words  = re.sub(r'\d+', '', text_lower).split()
+    angka  = re.findall(r'\d+', text_lower)
+    qty    = int(angka[-1]) if angka else 1   # angka terakhir = qty
 
-    # Coba cocokkan dengan produk yang ada
+    scored = []
     for p in products:
         nama = p[2].lower()
-        # Cek apakah nama produk ada di teks
-        if nama in text_lower or any(w in text_lower for w in nama.split()):
-            # Ambil angka dari teks
-            angka = re.findall(r'\d+', text)
-            qty = int(angka[0]) if angka else 1
-            return {
-                "found": True,
-                "items": [{"pid": p[0], "name": p[2], "price": p[3], "qty": qty}],
-                "message": "OK"
-            }
+        # Hitung berapa kata cocok
+        score = sum(1 for w in words if len(w) > 1 and w in nama)
+        if score > 0:
+            scored.append((score, p))
 
-    # ── Kalau manual gagal, coba via Gemini AI ────────────────────────────
+    if not scored:
+        return None, [], qty
+
+    # Urutkan dari score tertinggi
+    scored.sort(key=lambda x: -x[0])
+    best_score = scored[0][0]
+
+    # Ambil semua produk dengan score tertinggi (varian)
+    best = [p for s, p in scored if s == best_score]
+
+    if len(best) == 1:
+        return best[0], [], qty          # satu cocok persis
+    else:
+        return None, best, qty           # banyak varian → perlu dipilih
+
+def ai_parse_item(text, products):
+    """Parse teks jual — deteksi varian, fallback ke AI kalau perlu."""
+    import re
+
+    exact, variants, qty = find_matching_products(text, products)
+
+    # Satu produk cocok persis
+    if exact:
+        return {
+            "found": True,
+            "needs_choice": False,
+            "items": [{"pid": exact[0], "name": exact[2], "price": exact[3], "qty": qty}],
+            "message": "OK"
+        }
+
+    # Ada beberapa varian — perlu pilihan
+    if variants:
+        return {
+            "found": True,
+            "needs_choice": True,
+            "variants": [{"pid": p[0], "name": p[2], "price": p[3], "stock": p[5], "unit": p[7]} for p in variants],
+            "qty": qty,
+            "message": "Pilih varian"
+        }
+
+    # Fallback ke Gemini AI
     product_list = "\n".join([
         f"id:{p[0]}|nama:{p[2]}|harga:{p[3]}|stok:{p[5]}|satuan:{p[7]}"
         for p in products
@@ -332,26 +372,24 @@ Produk tersedia:
 Perintah: "{text}"
 
 Aturan:
-- Cocokkan nama produk secara fleksibel (tidak harus persis sama)
-- Jika ada angka setelah nama produk, itu adalah qty
-- Jika tidak ada angka, qty = 1
+- Cocokkan nama produk secara fleksibel
+- Jika ada beberapa produk yang mirip (varian ukuran), kembalikan semua sebagai pilihan
+- Angka di akhir teks biasanya adalah qty
 
-Kembalikan HANYA JSON (tanpa markdown, tanpa penjelasan):
-{{"found":true,"items":[{{"pid":ID_PRODUK,"name":"NAMA","price":HARGA,"qty":JUMLAH}}],"message":"ok"}}
-
-Jika tidak ada produk yang cocok:
-{{"found":false,"items":[],"message":"Produk tidak ditemukan"}}"""
+Kembalikan HANYA JSON:
+Jika satu produk cocok:
+{{"found":true,"needs_choice":false,"items":[{{"pid":ID,"name":"NAMA","price":HARGA,"qty":QTY}}]}}
+Jika beberapa varian:
+{{"found":true,"needs_choice":true,"variants":[{{"pid":ID,"name":"NAMA","price":HARGA,"stock":STOK,"unit":"SATUAN"}}...],"qty":QTY}}
+Jika tidak ada:
+{{"found":false,"items":[],"message":"tidak ditemukan"}}"""
 
     try:
-        resp = gemini.generate_content(prompt)
-        raw  = resp.text.strip()
-        # Bersihkan markdown jika ada
-        raw = re.sub(r'```json|```', '', raw).strip()
-        # Ambil JSON dari teks
+        resp  = gemini.generate_content(prompt)
+        raw   = resp.text.strip()
+        raw   = re.sub(r'```json|```', '', raw).strip()
         match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-        return json.loads(raw)
+        return json.loads(match.group() if match else raw)
     except Exception:
         return {"found": False, "items": [], "message": "Gagal memproses"}
 
@@ -527,6 +565,29 @@ async def jual_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return JUAL_ITEM
 
+    # ── Ada beberapa varian — tampilkan pilihan tombol ────────────────────
+    if parsed.get("needs_choice"):
+        variants = parsed.get("variants", [])
+        qty      = parsed.get("qty", 1)
+        ctx.user_data["pending_qty"] = qty
+
+        keyboard = []
+        for v in variants:
+            stok_icon = "🔴" if v["stock"] <= 0 else "🟢"
+            label = f"{v['name']} — {fmt_rp(v['price'])} (stok: {v['stock']} {v['unit']})"
+            keyboard.append([InlineKeyboardButton(
+                f"{stok_icon} {label}",
+                callback_data=f"var_{v['pid']}_{qty}"
+            )])
+        keyboard.append([InlineKeyboardButton("❌ Batal pilih", callback_data="var_batal")])
+
+        await update.message.reply_text(
+            f"🔍 Ada *{len(variants)} varian* ditemukan. Pilih yang dimaksud:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return JUAL_ITEM
+
     added = []
     for item in parsed.get("items", []):
         if item.get("price", 0) == 0 and item.get("pid") is None:
@@ -637,35 +698,127 @@ async def jual_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ── /tambah produk (ConversationHandler) ─────────────────────────────────────
+# ── /tambah produk — input satu baris ────────────────────────────────────────
+def ai_parse_produk(text):
+    """Parse input produk satu baris via Gemini AI."""
+    cats = ", ".join(CATEGORIES)
+    prompt = f"""Parse data produk toko berikut. Kembalikan HANYA JSON valid tanpa markdown:
+{{
+  "success": true/false,
+  "name": "nama produk lengkap dengan ukuran jika ada",
+  "price_sell": harga_jual_integer,
+  "price_buy": harga_beli_integer,
+  "stock": stok_integer,
+  "unit": "satuan (pcs/bungkus/botol/kg/renteng/lusin/dll)",
+  "category": "pilih dari [{cats}]",
+  "reason": "alasan jika gagal"
+}}
+Konversi: rb/ribu=x1000, jt/juta=x1000000, k=x1000.
+Urutan data biasanya: nama ukuran harga_jual harga_beli stok satuan
+Jika harga beli tidak ada, perkirakan 80% dari harga jual.
+Jika stok tidak ada, gunakan 0.
+Input: "{text}" """
+    resp = gemini.generate_content(prompt)
+    import re
+    raw = resp.text.strip()
+    raw = re.sub(r'```json|```', '', raw).strip()
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    return json.loads(raw)
+
 async def cmd_tambah(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["new_prod"] = {}
+    """Tampilkan panduan input satu baris."""
     await update.message.reply_text(
-        "📦 *Tambah Produk Baru*\n\nMasukkan nama produk:",
+        "📦 *Tambah Produk Baru*\n\n"
+        "Ketik dalam *satu baris* dengan format:\n"
+        "`nama_produk harga_jual harga_beli stok satuan`\n\n"
+        "📝 *Contoh:*\n"
+        "`garam himalaya 100g 3500 2500 10 bungkus`\n"
+        "`aqua botol 600ml 4000 3000 48 botol`\n"
+        "`indomie goreng 3500 2800 100 bungkus`\n"
+        "`minyak goreng 1L 18000 15000 20 botol`\n"
+        "`gula pasir 1kg 15000 12500 50 kg`\n\n"
+        "💡 *Tips:*\n"
+        "• Harga bisa pakai `rb` → `3.5rb` = 3500\n"
+        "• Kalau harga beli tidak tahu, cukup tulis harga jual\n"
+        "• Satuan bebas: pcs, botol, bungkus, kg, renteng, lusin\n\n"
+        "Atau ketik *wizard* untuk input langkah per langkah.",
         parse_mode="Markdown"
     )
     return PRODUK_NAMA
 
 async def produk_nama(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["new_prod"]["name"] = update.message.text.strip()
-    await update.message.reply_text(f"💰 Harga *jual* (contoh: 3500):", parse_mode="Markdown")
-    return PRODUK_HARGA_JUAL
+    """Handle input — bisa satu baris atau mulai wizard."""
+    text  = update.message.text.strip()
+    owner = update.effective_user.id
+
+    # Mode wizard
+    if text.lower() == "wizard":
+        ctx.user_data["new_prod"] = {}
+        ctx.user_data["wizard_mode"] = True
+        await update.message.reply_text("📦 Masukkan *nama produk*:", parse_mode="Markdown")
+        return PRODUK_HARGA_JUAL  # pakai state berbeda untuk wizard
+
+    # Mode satu baris — parse via AI
+    await update.message.reply_text("⏳ Memproses...", parse_mode="Markdown")
+    try:
+        parsed = ai_parse_produk(text)
+    except Exception:
+        await update.message.reply_text(
+            "⚠️ Gagal memparse. Coba format:\n`nama harga_jual harga_beli stok satuan`\n\n"
+            "Contoh: `indomie goreng 3500 2800 100 bungkus`",
+            parse_mode="Markdown"
+        )
+        return PRODUK_NAMA
+
+    if not parsed.get("success"):
+        await update.message.reply_text(
+            f"⚠️ {parsed.get('reason','Format tidak dikenali.')}\n\n"
+            "Contoh: `garam himalaya 100g 3500 2500 10 bungkus`",
+            parse_mode="Markdown"
+        )
+        return PRODUK_NAMA
+
+    # Simpan parsed data & minta konfirmasi + pilih kategori
+    ctx.user_data["new_prod"] = parsed
+    margin = parsed["price_sell"] - parsed["price_buy"]
+    pct    = round(margin / parsed["price_sell"] * 100) if parsed["price_sell"] else 0
+
+    cats     = [CATEGORIES[i:i+3] for i in range(0, len(CATEGORIES), 3)]
+    keyboard = [[InlineKeyboardButton(f"{CAT_EMOJI[c]} {c}", callback_data=f"cat_{c}") for c in row] for row in cats]
+    keyboard.append([InlineKeyboardButton("✏️ Ketik ulang", callback_data="cat_ulang")])
+
+    await update.message.reply_text(
+        f"✅ *Konfirmasi Produk*\n\n"
+        f"📦 Nama   : *{parsed['name']}*\n"
+        f"💰 Jual   : {fmt_full(parsed['price_sell'])}\n"
+        f"💸 Beli   : {fmt_full(parsed['price_buy'])}\n"
+        f"📈 Margin : {fmt_full(margin)} ({pct}%)\n"
+        f"📊 Stok   : {parsed['stock']} {parsed['unit']}\n\n"
+        f"🗂️ Pilih kategori untuk menyimpan:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return PRODUK_SATUAN  # tunggu callback kategori
 
 async def produk_harga_jual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        val = int(update.message.text.strip().replace(".","").replace(",",""))
-        ctx.user_data["new_prod"]["price_sell"] = val
-        await update.message.reply_text(f"💸 Harga *beli/modal* (contoh: 2800):", parse_mode="Markdown")
-        return PRODUK_HARGA_BELI
-    except:
-        await update.message.reply_text("⚠️ Masukkan angka saja.")
-        return PRODUK_HARGA_JUAL
+    """Wizard step: nama produk sudah diisi, sekarang minta harga jual."""
+    if not ctx.user_data.get("wizard_mode"):
+        return PRODUK_NAMA
+    ctx.user_data["new_prod"]["name"] = update.message.text.strip()
+    await update.message.reply_text("💰 Harga *jual* (contoh: 3500):", parse_mode="Markdown")
+    return PRODUK_HARGA_BELI
 
 async def produk_harga_beli(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         val = int(update.message.text.strip().replace(".","").replace(",",""))
+        if ctx.user_data.get("wizard_mode"):
+            ctx.user_data["new_prod"]["price_sell"] = val
+            await update.message.reply_text("💸 Harga *beli/modal* (contoh: 2800):", parse_mode="Markdown")
+            return PRODUK_STOK
         ctx.user_data["new_prod"]["price_buy"] = val
-        await update.message.reply_text("📊 Stok awal (contoh: 50):")
+        await update.message.reply_text("📊 Stok awal:", parse_mode="Markdown")
         return PRODUK_STOK
     except:
         await update.message.reply_text("⚠️ Masukkan angka saja.")
@@ -674,47 +827,74 @@ async def produk_harga_beli(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def produk_stok(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         val = int(update.message.text.strip())
-        ctx.user_data["new_prod"]["stock"] = val
-        await update.message.reply_text("📏 Satuan produk (contoh: pcs / botol / bungkus / kg):")
+        prod = ctx.user_data.get("new_prod", {})
+        if ctx.user_data.get("wizard_mode"):
+            prod["price_buy"] = val
+            ctx.user_data["new_prod"] = prod
+            await update.message.reply_text("📊 Stok awal:", parse_mode="Markdown")
+            return PRODUK_SATUAN
+        prod["stock"] = val
+        ctx.user_data["new_prod"] = prod
+        await update.message.reply_text("📏 Satuan (pcs/botol/bungkus/kg):", parse_mode="Markdown")
         return PRODUK_SATUAN
     except:
         await update.message.reply_text("⚠️ Masukkan angka saja.")
         return PRODUK_STOK
 
 async def produk_satuan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["new_prod"]["unit"] = update.message.text.strip()
-    # Pilih kategori
-    cats = [CATEGORIES[i:i+3] for i in range(0, len(CATEGORIES), 3)]
+    prod = ctx.user_data.get("new_prod", {})
+    if ctx.user_data.get("wizard_mode"):
+        prod["stock"] = int(update.message.text.strip()) if update.message.text.strip().isdigit() else 0
+    else:
+        prod["unit"] = update.message.text.strip()
+    ctx.user_data["new_prod"] = prod
+    cats     = [CATEGORIES[i:i+3] for i in range(0, len(CATEGORIES), 3)]
     keyboard = [[InlineKeyboardButton(f"{CAT_EMOJI[c]} {c}", callback_data=f"cat_{c}") for c in row] for row in cats]
-    await update.message.reply_text(
-        "🗂️ Pilih kategori:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return PRODUK_SATUAN  # tunggu callback
+    await update.message.reply_text("🗂️ Pilih kategori:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return PRODUK_SATUAN
 
 async def produk_kategori_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query    = update.callback_query
     await query.answer()
-    category = query.data.replace("cat_","")
     owner    = query.from_user.id
+
+    if query.data == "cat_ulang":
+        ctx.user_data["new_prod"] = {}
+        await query.edit_message_text(
+            "✏️ Ketik ulang data produk:\n`nama harga_jual harga_beli stok satuan`",
+            parse_mode="Markdown"
+        )
+        return PRODUK_NAMA
+
+    category = query.data.replace("cat_","")
     prod     = ctx.user_data.get("new_prod", {})
 
     pid = db_add_product(
-        owner, prod["name"], prod["price_sell"], prod["price_buy"],
-        prod["stock"], 5, prod["unit"], category
+        owner,
+        prod.get("name","Produk"),
+        prod.get("price_sell", 0),
+        prod.get("price_buy", 0),
+        prod.get("stock", 0),
+        5,
+        prod.get("unit","pcs"),
+        category
     )
-    margin = prod["price_sell"] - prod["price_buy"]
+    margin = prod.get("price_sell",0) - prod.get("price_buy",0)
+    pct    = round(margin / prod["price_sell"] * 100) if prod.get("price_sell") else 0
+
     await query.edit_message_text(
-        f"✅ *Produk berhasil ditambahkan!*\n\n"
-        f"📦 {prod['name']} (ID: #{pid})\n"
-        f"🏷️ Kategori: {category} {CAT_EMOJI.get(category,'')}\n"
-        f"💰 Jual: {fmt_full(prod['price_sell'])}\n"
-        f"💸 Beli: {fmt_full(prod['price_buy'])}\n"
-        f"📈 Margin: {fmt_full(margin)} ({round(margin/prod['price_sell']*100) if prod['price_sell'] else 0}%)\n"
-        f"📊 Stok: {prod['stock']} {prod['unit']}",
+        f"✅ *Produk berhasil disimpan!*\n\n"
+        f"📦 {prod.get('name')} (ID: #{pid})\n"
+        f"🏷️ {category} {CAT_EMOJI.get(category,'')}\n"
+        f"💰 Jual : {fmt_full(prod.get('price_sell',0))}\n"
+        f"💸 Beli : {fmt_full(prod.get('price_buy',0))}\n"
+        f"📈 Margin: {fmt_full(margin)} ({pct}%)\n"
+        f"📊 Stok : {prod.get('stock',0)} {prod.get('unit','pcs')}\n\n"
+        f"Tambah produk lagi dengan /tambah",
         parse_mode="Markdown"
     )
-    ctx.user_data["new_prod"] = {}
+    ctx.user_data["new_prod"]    = {}
+    ctx.user_data["wizard_mode"] = False
     return ConversationHandler.END
 
 
@@ -1161,6 +1341,42 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("lap_"):
         await show_laporan(update, data.replace("lap_",""), owner)
+
+    elif data.startswith("var_"):
+        # Pilihan varian produk saat /jual
+        val = data.replace("var_","")
+        if val == "batal":
+            await query.edit_message_text("❌ Pilihan dibatalkan. Ketik nama produk lain atau *selesai*.", parse_mode="Markdown")
+            return
+
+        parts = val.split("_")
+        pid   = int(parts[0])
+        qty   = int(parts[1]) if len(parts) > 1 else ctx.user_data.get("pending_qty", 1)
+        cart  = ctx.user_data.get("cart", [])
+
+        prod = db_get_product(owner, pid)
+        if not prod:
+            await query.edit_message_text("⚠️ Produk tidak ditemukan.")
+            return
+
+        # Cek stok
+        if prod[5] < qty:
+            await query.edit_message_text(
+                f"⚠️ Stok *{prod[2]}* hanya {prod[5]} {prod[7]}!",
+                parse_mode="Markdown"
+            )
+            return
+
+        cart.append({"pid": pid, "name": prod[2], "price": prod[3], "qty": qty, "subtotal": prod[3]*qty})
+        ctx.user_data["cart"] = cart
+        db_save_cart(owner, cart)
+
+        await query.edit_message_text(
+            f"✅ *{prod[2]}* × {qty} = {fmt_full(prod[3]*qty)} ditambahkan!\n\n"
+            f"{cart_summary(cart)}\n\n"
+            f"Tambah item lagi atau ketik *selesai*.",
+            parse_mode="Markdown"
+        )
 
     elif data.startswith("cart_"):
         action     = data.replace("cart_","")
