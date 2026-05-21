@@ -4,7 +4,7 @@ Point of Sale lengkap untuk toko kelontong
 Powered by Google Gemini API (GRATIS)
 """
 
-import os, json, csv, io, sqlite3
+import os, json, csv, io, sqlite3, pathlib
 from datetime import datetime, timedelta
 import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,7 +16,12 @@ from telegram.ext import (
 # ── Config ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-DB_PATH        = "pos_toko.db"
+
+# ── Persistent storage — data tidak hilang saat redeploy ─────────────────────
+# Render Persistent Disk mount di /data
+# Lokal (development) tetap pakai folder saat ini
+DATA_DIR = pathlib.Path("/data") if pathlib.Path("/data").exists() else pathlib.Path(".")
+DB_PATH  = str(DATA_DIR / "pos_toko.db")
 
 genai.configure(api_key=GEMINI_API_KEY)
 gemini = genai.GenerativeModel(
@@ -33,17 +38,15 @@ gemini = genai.GenerativeModel(
     SETTING_QRIS, SETTING_REKENING,
 ) = range(15)
 
-# ── Pembayaran Config (simpan di file json per user) ──────────────────────────
-import pathlib
-
+# ── Pembayaran Config ─────────────────────────────────────────────────────────
 def get_payment_config(owner_id):
-    path = pathlib.Path(f"payment_{owner_id}.json")
+    path = DATA_DIR / f"payment_{owner_id}.json"
     if path.exists():
         return json.loads(path.read_text())
     return {"qris_name": "", "qris_number": "", "bank_name": "", "bank_number": "", "bank_holder": ""}
 
 def save_payment_config(owner_id, config):
-    path = pathlib.Path(f"payment_{owner_id}.json")
+    path = DATA_DIR / f"payment_{owner_id}.json"
     path.write_text(json.dumps(config, ensure_ascii=False))
 
 CAT_EMOJI = {
@@ -106,7 +109,33 @@ def init_db():
             date        TEXT    NOT NULL,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS pending_cart (
+            owner_id    INTEGER PRIMARY KEY,
+            cart_json   TEXT    NOT NULL,
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         """)
+
+# ── Pending Cart (keranjang belum bayar) ─────────────────────────────────────
+def db_save_cart(owner_id, cart):
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute(
+            "INSERT OR REPLACE INTO pending_cart (owner_id, cart_json, updated_at) VALUES (?,?,CURRENT_TIMESTAMP)",
+            (owner_id, json.dumps(cart, ensure_ascii=False))
+        )
+
+def db_load_cart(owner_id):
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute(
+            "SELECT cart_json FROM pending_cart WHERE owner_id=?", (owner_id,)
+        ).fetchone()
+    if row:
+        return json.loads(row[0])
+    return []
+
+def db_clear_cart(owner_id):
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("DELETE FROM pending_cart WHERE owner_id=?", (owner_id,))
 
 # Products
 def db_add_product(owner, name, price_sell, price_buy, stock, min_stock, unit, category):
@@ -344,6 +373,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Muslim Kids Store Gorontalo* siap membantu.\n\n"
         "📌 *Menu Utama:*\n"
         "🛒 /jual — Catat penjualan\n"
+        "🧺 /keranjang — Lanjutkan keranjang tersimpan\n"
         "📦 /produk — Kelola produk\n"
         "📊 /laporan — Laporan & omzet\n"
         "📉 /stok — Cek & update stok\n"
@@ -385,7 +415,27 @@ async def cmd_bantuan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── /jual (ConversationHandler) ───────────────────────────────────────────────
 async def cmd_jual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    owner        = update.effective_user.id
+    saved_cart   = db_load_cart(owner)
     ctx.user_data["cart"] = []
+    ctx.user_data.pop("awaiting", None)
+
+    if saved_cart:
+        total = sum(i["qty"] * i["price"] for i in saved_cart)
+        keyboard = [
+            [InlineKeyboardButton("✅ Lanjutkan keranjang ini", callback_data="cart_lanjut")],
+            [InlineKeyboardButton("🗑️ Buang & mulai baru",      callback_data="cart_baru")],
+        ]
+        ctx.user_data["saved_cart_temp"] = saved_cart
+        await update.message.reply_text(
+            f"🛒 *Ada keranjang yang belum dibayar!*\n\n"
+            f"{cart_summary(saved_cart)}\n\n"
+            f"Mau lanjutkan atau mulai dari awal?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return JUAL_ITEM
+
     await update.message.reply_text(
         "🛒 *Mode Penjualan*\n\n"
         "Masukkan nama produk & jumlah:\n"
@@ -395,6 +445,32 @@ async def cmd_jual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
     return JUAL_ITEM
+
+async def cmd_keranjang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Lihat & lanjutkan keranjang yang tersimpan."""
+    owner      = update.effective_user.id
+    saved_cart = db_load_cart(owner)
+
+    if not saved_cart:
+        await update.message.reply_text(
+            "🛒 Tidak ada keranjang yang tersimpan.\n\nGunakan /jual untuk mulai transaksi baru."
+        )
+        return
+
+    total    = sum(i["qty"] * i["price"] for i in saved_cart)
+    keyboard = [
+        [InlineKeyboardButton("✅ Lanjutkan & bayar sekarang", callback_data="cart_lanjut")],
+        [InlineKeyboardButton("➕ Tambah item lagi",            callback_data="cart_tambah")],
+        [InlineKeyboardButton("🗑️ Hapus keranjang",            callback_data="cart_hapus")],
+    ]
+    ctx.user_data["saved_cart_temp"] = saved_cart
+    await update.message.reply_text(
+        f"🛒 *Keranjang Tersimpan*\n\n"
+        f"{cart_summary(saved_cart)}\n\n"
+        f"Mau diapakan?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def jual_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text    = update.message.text.strip()
@@ -478,10 +554,11 @@ async def jual_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.user_data["cart"] = cart
     if added:
-        total = sum(i["qty"] * i["price"] for i in cart)
+        db_save_cart(owner, cart)
         await update.message.reply_text(
             "\n".join(added) + f"\n\n{cart_summary(cart)}\n\n"
-            "Tambah item lagi atau ketik *selesai*.",
+            "Tambah item lagi atau ketik *selesai*.\n"
+            "💾 _Keranjang disimpan otomatis_",
             parse_mode="Markdown"
         )
     return JUAL_ITEM
@@ -508,46 +585,51 @@ async def jual_bayar_tunai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     sale_id, change = db_create_sale(owner, cart, total, payment, "tunai")
     ctx.user_data["cart"] = []
+    ctx.user_data.pop("awaiting", None)
+    db_clear_cart(owner)
     receipt = make_receipt(sale_id, cart, total, payment, change, "tunai")
     await update.message.reply_text(receipt, parse_mode="Markdown")
     return ConversationHandler.END
 
+async def jual_konfirm_transfer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handler konfirmasi setelah transfer/QRIS — user ketik 'sudah'."""
+    text   = update.message.text.strip().lower()
+    owner  = update.effective_user.id
+    cart   = ctx.user_data.get("cart", [])
+    total  = ctx.user_data.get("jual_total", 0)
+    method = ctx.user_data.get("pay_method", "transfer")
+
+    if text in ["sudah","lunas","ok","oke","ya","done","✅"]:
+        sale_id, _ = db_create_sale(owner, cart, total, total, method)
+        ctx.user_data["cart"] = []
+        ctx.user_data.pop("awaiting", None)
+        db_clear_cart(owner)
+        receipt = make_receipt(sale_id, cart, total, total, 0, method)
+        await update.message.reply_text(
+            f"✅ *Pembayaran dikonfirmasi!*\n\n{receipt}", parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    else:
+        method_label = "QRIS" if method == "qris" else "Transfer"
+        await update.message.reply_text(
+            f"Ketik *sudah* setelah pembayaran {method_label} diterima, atau /batal untuk membatalkan.",
+            parse_mode="Markdown"
+        )
+        return JUAL_PILIH_BAYAR
+
 async def jual_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Router untuk state JUAL_PILIH_BAYAR — teruskan ke handler yang tepat."""
+    """Router untuk JUAL_PILIH_BAYAR — arahkan ke handler sesuai metode."""
     awaiting = ctx.user_data.get("awaiting")
     if awaiting == "tunai":
         return await jual_bayar_tunai(update, ctx)
     elif awaiting == "nontunai":
         return await jual_konfirm_transfer(update, ctx)
     else:
-        # Masih nunggu pilih metode — abaikan teks
         await update.message.reply_text(
             "💳 Silakan pilih metode pembayaran dengan menekan tombol di atas.",
             parse_mode="Markdown"
         )
         return JUAL_PILIH_BAYAR
-    """Handler konfirmasi setelah transfer — user ketik 'sudah' atau nominal."""
-    text  = update.message.text.strip().lower()
-    owner = update.effective_user.id
-    cart  = ctx.user_data.get("cart", [])
-    total = ctx.user_data.get("jual_total", 0)
-    method = ctx.user_data.get("pay_method", "transfer")
-
-    if text in ["sudah", "lunas", "ok", "oke", "ya", "done", "✅"]:
-        sale_id, _ = db_create_sale(owner, cart, total, total, method)
-        ctx.user_data["cart"] = []
-        receipt = make_receipt(sale_id, cart, total, total, 0, method)
-        await update.message.reply_text(
-            f"✅ *Pembayaran dikonfirmasi!*\n\n{receipt}",
-            parse_mode="Markdown"
-        )
-        return ConversationHandler.END
-    else:
-        await update.message.reply_text(
-            "Ketik *sudah* setelah pembayaran diterima, atau /batal untuk membatalkan.",
-            parse_mode="Markdown"
-        )
-        return JUAL_KONFIRM_TRANSFER
 
 async def jual_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["cart"] = []
@@ -1080,6 +1162,52 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("lap_"):
         await show_laporan(update, data.replace("lap_",""), owner)
 
+    elif data.startswith("cart_"):
+        action     = data.replace("cart_","")
+        saved_cart = ctx.user_data.get("saved_cart_temp", [])
+
+        if action == "lanjut":
+            # Load keranjang tersimpan → langsung ke pilih bayar
+            ctx.user_data["cart"]       = saved_cart
+            ctx.user_data["jual_total"] = sum(i["qty"]*i["price"] for i in saved_cart)
+            keyboard = [
+                [InlineKeyboardButton("💵 Tunai",    callback_data="pay_tunai")],
+                [InlineKeyboardButton("📱 QRIS",     callback_data="pay_qris")],
+                [InlineKeyboardButton("🏦 Transfer", callback_data="pay_transfer")],
+            ]
+            await query.edit_message_text(
+                f"{cart_summary(saved_cart)}\n\n💳 *Pilih metode pembayaran:*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif action == "tambah":
+            # Load keranjang tersimpan → balik ke mode input item
+            ctx.user_data["cart"] = saved_cart
+            await query.edit_message_text(
+                f"{cart_summary(saved_cart)}\n\n"
+                "➕ Tambah item lagi atau ketik *selesai* untuk bayar:",
+                parse_mode="Markdown"
+            )
+
+        elif action == "baru":
+            # Buang keranjang lama → mulai baru
+            db_clear_cart(owner)
+            ctx.user_data["cart"] = []
+            await query.edit_message_text(
+                "🛒 *Mode Penjualan Baru*\n\n"
+                "Masukkan nama produk & jumlah:\n"
+                "`indomie goreng 3`\n\n"
+                "Ketik *selesai* jika sudah.",
+                parse_mode="Markdown"
+            )
+
+        elif action == "hapus":
+            db_clear_cart(owner)
+            ctx.user_data["cart"] = []
+            ctx.user_data.pop("saved_cart_temp", None)
+            await query.edit_message_text("🗑️ Keranjang berhasil dihapus.")
+
     elif data.startswith("cat_"):
         await produk_kategori_callback(update, ctx)
 
@@ -1261,6 +1389,8 @@ def main():
 
     app.add_handler(CommandHandler("start",               cmd_start))
     app.add_handler(CommandHandler("bantuan",             cmd_bantuan))
+    app.add_handler(CommandHandler("jual",                cmd_jual))
+    app.add_handler(CommandHandler("keranjang",           cmd_keranjang))
     app.add_handler(CommandHandler("produk",              cmd_produk))
     app.add_handler(CommandHandler("cari",                cmd_cari))
     app.add_handler(CommandHandler("stok",                cmd_stok))
