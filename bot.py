@@ -1,5 +1,5 @@
 """
-POS Toko Muslim Kids Store-Gorontalo — Telegram Bot
+Toko Muslim Kids Store-Gorontalo — Telegram Bot
 Point of Sale lengkap untuk toko Muslim Kids Store-Gorontalo
 Powered by Google Gemini API (GRATIS)
 """
@@ -26,11 +26,25 @@ gemini = genai.GenerativeModel(
 
 # ConversationHandler states
 (
-    JUAL_ITEM, JUAL_BAYAR,
+    JUAL_ITEM, JUAL_PILIH_BAYAR, JUAL_BAYAR_TUNAI, JUAL_KONFIRM_TRANSFER,
     PRODUK_NAMA, PRODUK_HARGA_JUAL, PRODUK_HARGA_BELI, PRODUK_STOK, PRODUK_SATUAN,
     STOK_MASUK_PRODUK, STOK_MASUK_QTY,
     EDIT_FIELD, EDIT_VALUE,
-) = range(11)
+    SETTING_QRIS, SETTING_REKENING,
+) = range(15)
+
+# ── Pembayaran Config (simpan di file json per user) ──────────────────────────
+import pathlib
+
+def get_payment_config(owner_id):
+    path = pathlib.Path(f"payment_{owner_id}.json")
+    if path.exists():
+        return json.loads(path.read_text())
+    return {"qris_name": "", "qris_number": "", "bank_name": "", "bank_number": "", "bank_holder": ""}
+
+def save_payment_config(owner_id, config):
+    path = pathlib.Path(f"payment_{owner_id}.json")
+    path.write_text(json.dumps(config, ensure_ascii=False))
 
 CAT_EMOJI = {
     "Minuman":"🥤","Makanan":"🍜","Snack":"🍿","Rokok":"🚬",
@@ -57,12 +71,13 @@ def init_db():
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS sales (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_id    INTEGER NOT NULL,
-            total       INTEGER NOT NULL,
-            payment     INTEGER NOT NULL DEFAULT 0,
-            change      INTEGER NOT NULL DEFAULT 0,
-            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id        INTEGER NOT NULL,
+            total           INTEGER NOT NULL,
+            payment         INTEGER NOT NULL DEFAULT 0,
+            change          INTEGER NOT NULL DEFAULT 0,
+            payment_method  TEXT    NOT NULL DEFAULT 'tunai',
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS sale_items (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,12 +157,12 @@ def db_low_stock(owner):
         ).fetchall()
 
 # Sales
-def db_create_sale(owner, items, total, payment):
-    change = payment - total
+def db_create_sale(owner, items, total, payment, payment_method="tunai"):
+    change = payment - total if payment_method == "tunai" else 0
     with sqlite3.connect(DB_PATH) as c:
         cur = c.execute(
-            "INSERT INTO sales (owner_id,total,payment,change) VALUES (?,?,?,?)",
-            (owner, total, payment, change)
+            "INSERT INTO sales (owner_id,total,payment,change,payment_method) VALUES (?,?,?,?,?)",
+            (owner, total, payment, change, payment_method)
         )
         sale_id = cur.lastrowid
         for item in items:
@@ -215,7 +230,8 @@ def fmt_full(v): return f"Rp {int(v):,}"
 def now_str():   return datetime.now().strftime("%d/%m/%Y %H:%M")
 def today():     return datetime.now().strftime("%Y-%m-%d")
 
-def make_receipt(sale_id, items, total, payment, change):
+def make_receipt(sale_id, items, total, payment, change, method="tunai"):
+    method_label = {"tunai":"💵 Tunai", "qris":"📱 QRIS", "transfer":"🏦 Transfer"}.get(method, method)
     lines = [
         "🧾 *STRUK PEMBAYARAN*",
         f"No: #{sale_id:04d} | {now_str()}",
@@ -226,12 +242,17 @@ def make_receipt(sale_id, items, total, payment, change):
         lines.append(f"  {it['qty']} × {fmt_full(it['price'])} = {fmt_full(it['subtotal'])}")
     lines += [
         "─" * 28,
-        f"💰 *TOTAL     : {fmt_full(total)}*",
-        f"💵 Bayar     : {fmt_full(payment)}",
-        f"💚 Kembalian : *{fmt_full(change)}*",
-        "─" * 28,
-        "Terima kasih! 🙏",
+        f"💰 *TOTAL         : {fmt_full(total)}*",
+        f"{method_label}",
     ]
+    if method == "tunai":
+        lines += [
+            f"💵 Bayar         : {fmt_full(payment)}",
+            f"💚 Kembalian     : *{fmt_full(change)}*",
+        ]
+    else:
+        lines.append(f"✅ *LUNAS*")
+    lines += ["─" * 28, "Terima kasih! 🙏"]
     return "\n".join(lines)
 
 def cart_summary(cart):
@@ -280,13 +301,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
     await update.message.reply_text(
         f"🏪 Selamat datang *{name}*!\n\n"
-        "*POS Toko Muslim Kids Store-Gorontalo* siap membantu.\n\n"
+        "*Muslim Kids Store Gorontalo* siap membantu.\n\n"
         "📌 *Menu Utama:*\n"
         "🛒 /jual — Catat penjualan\n"
         "📦 /produk — Kelola produk\n"
         "📊 /laporan — Laporan & omzet\n"
         "📉 /stok — Cek & update stok\n"
         "💸 /pengeluaran — Catat pengeluaran\n"
+        "💳 /setting\_pembayaran — Atur QRIS & Rekening\n"
         "📥 /export — Export data CSV\n"
         "⚠️ /stok\_tipis — Alert stok menipis\n"
         "❓ /bantuan — Panduan lengkap",
@@ -297,7 +319,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── /bantuan ──────────────────────────────────────────────────────────────────
 async def cmd_bantuan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *Panduan POS Toko Kelontong*\n\n"
+        "📖 *Panduan POS Toko Muslim Kids Store-Gorontalo*\n\n"
         "*🛒 Penjualan:*\n"
         "Ketik `/jual` lalu masukkan item:\n"
         "`indomie goreng 3`\n"
@@ -339,7 +361,7 @@ async def jual_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     owner   = update.effective_user.id
     cart    = ctx.user_data.get("cart", [])
 
-    if text.lower() == "batal" or text == "/batal":
+    if text.lower() in ["batal", "/batal"]:
         ctx.user_data["cart"] = []
         await update.message.reply_text("❌ Penjualan dibatalkan.")
         return ConversationHandler.END
@@ -350,38 +372,56 @@ async def jual_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return JUAL_ITEM
         total = sum(i["qty"] * i["price"] for i in cart)
         ctx.user_data["jual_total"] = total
+        keyboard = [
+            [InlineKeyboardButton("💵 Tunai",    callback_data="pay_tunai")],
+            [InlineKeyboardButton("📱 QRIS",     callback_data="pay_qris")],
+            [InlineKeyboardButton("🏦 Transfer", callback_data="pay_transfer")],
+        ]
         await update.message.reply_text(
-            f"{cart_summary(cart)}\n\n"
-            f"💵 Masukkan nominal pembayaran (contoh: `50000`):",
+            f"{cart_summary(cart)}\n\n💳 *Pilih metode pembayaran:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return JUAL_PILIH_BAYAR
+
+    # Cek produk dulu — jika kosong langsung kasih tahu
+    products = db_get_all_products(owner)
+    if not products:
+        await update.message.reply_text(
+            "⚠️ *Belum ada produk di database!*\n\n"
+            "Tambah produk dulu dengan /tambah sebelum bisa berjualan.\n\n"
+            "Atau ketik /batal untuk keluar dari mode penjualan.",
             parse_mode="Markdown"
         )
-        return JUAL_BAYAR
+        return JUAL_ITEM
 
     # Parse item via AI
-    products = db_get_all_products(owner)
     try:
         parsed = ai_parse_item(text, products)
-    except Exception:
-        await update.message.reply_text("⚠️ Gagal memproses. Coba lagi, contoh: `indomie 3`")
+    except Exception as e:
+        await update.message.reply_text(
+            f"⚠️ Gagal memproses item. Coba ketik ulang.\nContoh: `indomie goreng 3`",
+            parse_mode="Markdown"
+        )
         return JUAL_ITEM
 
     if not parsed.get("found"):
         await update.message.reply_text(
-            f"🤔 {parsed.get('message','Tidak dikenali.')}\nCoba: `indomie goreng 3`"
+            f"🤔 {parsed.get('message','Tidak dikenali.')}\n\nCoba ketik: `nama produk jumlah`\nContoh: `indomie 3` atau `aqua 2`"
         )
         return JUAL_ITEM
 
     added = []
     for item in parsed.get("items", []):
-        if item["price"] == 0 and item["pid"] is None:
+        if item.get("price", 0) == 0 and item.get("pid") is None:
             await update.message.reply_text(
-                f"⚠️ Produk *{item['name']}* tidak ditemukan di daftar.\n"
-                "Tambah dulu dengan /tambah atau cek nama produknya.",
+                f"⚠️ Produk *{item['name']}* tidak ditemukan.\n"
+                f"Cek nama produk dengan /produk atau tambah dulu dengan /tambah.",
                 parse_mode="Markdown"
             )
             continue
         # Cek stok
-        if item["pid"]:
+        if item.get("pid"):
             prod = db_get_product(owner, item["pid"])
             if prod and prod[5] < item["qty"]:
                 await update.message.reply_text(
@@ -390,11 +430,11 @@ async def jual_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
                 continue
         cart.append({
-            "pid": item["pid"], "name": item["name"],
+            "pid": item.get("pid"), "name": item["name"],
             "price": item["price"], "qty": item["qty"],
             "subtotal": item["price"] * item["qty"],
         })
-        added.append(f"✅ {item['name']} × {item['qty']} = {fmt_full(item['price']*item['qty'])}")
+        added.append(f"✅ {item['name']} × {item['qty']} = {fmt_full(item['price'] * item['qty'])}")
 
     ctx.user_data["cart"] = cart
     if added:
@@ -406,7 +446,7 @@ async def jual_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     return JUAL_ITEM
 
-async def jual_bayar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def jual_bayar_tunai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text  = update.message.text.strip().replace(".","").replace(",","")
     owner = update.effective_user.id
     cart  = ctx.user_data.get("cart", [])
@@ -416,21 +456,45 @@ async def jual_bayar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         payment = int(text)
     except ValueError:
         await update.message.reply_text("⚠️ Masukkan angka saja. Contoh: `50000`")
-        return JUAL_BAYAR
+        return JUAL_BAYAR_TUNAI
 
     if payment < total:
         await update.message.reply_text(
-            f"⚠️ Pembayaran kurang! Total *{fmt_full(total)}*, bayar *{fmt_full(payment)}*.\n"
+            f"⚠️ Kurang! Total *{fmt_full(total)}*, bayar *{fmt_full(payment)}*.\n"
             "Masukkan ulang nominal yang cukup:",
             parse_mode="Markdown"
         )
-        return JUAL_BAYAR
+        return JUAL_BAYAR_TUNAI
 
-    sale_id, change = db_create_sale(owner, cart, total, payment)
+    sale_id, change = db_create_sale(owner, cart, total, payment, "tunai")
     ctx.user_data["cart"] = []
-    receipt = make_receipt(sale_id, cart, total, payment, change)
+    receipt = make_receipt(sale_id, cart, total, payment, change, "tunai")
     await update.message.reply_text(receipt, parse_mode="Markdown")
     return ConversationHandler.END
+
+async def jual_konfirm_transfer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handler konfirmasi setelah transfer — user ketik 'sudah' atau nominal."""
+    text  = update.message.text.strip().lower()
+    owner = update.effective_user.id
+    cart  = ctx.user_data.get("cart", [])
+    total = ctx.user_data.get("jual_total", 0)
+    method = ctx.user_data.get("pay_method", "transfer")
+
+    if text in ["sudah", "lunas", "ok", "oke", "ya", "done", "✅"]:
+        sale_id, _ = db_create_sale(owner, cart, total, total, method)
+        ctx.user_data["cart"] = []
+        receipt = make_receipt(sale_id, cart, total, total, 0, method)
+        await update.message.reply_text(
+            f"✅ *Pembayaran dikonfirmasi!*\n\n{receipt}",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            "Ketik *sudah* setelah pembayaran diterima, atau /batal untuk membatalkan.",
+            parse_mode="Markdown"
+        )
+        return JUAL_KONFIRM_TRANSFER
 
 async def jual_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["cart"] = []
@@ -516,6 +580,72 @@ async def produk_kategori_callback(update: Update, ctx: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown"
     )
     ctx.user_data["new_prod"] = {}
+    return ConversationHandler.END
+
+
+async def cmd_setting_pembayaran(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    owner  = update.effective_user.id
+    config = get_payment_config(owner)
+    qris_info = f"📱 *QRIS:* {config['qris_name']} — {config['qris_number']}" if config['qris_number'] else "📱 *QRIS:* Belum diset"
+    bank_info = (f"🏦 *Transfer:* {config['bank_name']} a/n {config['bank_holder']}\n   No: `{config['bank_number']}`"
+                 if config['bank_number'] else "🏦 *Transfer:* Belum diset")
+    keyboard = [
+        [InlineKeyboardButton("📱 Atur QRIS",     callback_data="set_qris")],
+        [InlineKeyboardButton("🏦 Atur Rekening",  callback_data="set_rekening")],
+    ]
+    await update.message.reply_text(
+        f"💳 *Setting Pembayaran*\n\n{qris_info}\n{bank_info}\n\n"
+        "Pilih yang ingin diatur:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def setting_qris_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📱 *Atur Info QRIS*\n\nKetik format:\n`NamaDompet NomorHP`\n\nContoh:\n`GoPay 081234567890`",
+        parse_mode="Markdown"
+    )
+    return SETTING_QRIS
+
+async def setting_qris_save(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    owner  = update.effective_user.id
+    parts  = update.message.text.strip().split(None, 1)
+    config = get_payment_config(owner)
+    if len(parts) >= 2:
+        config["qris_name"]   = parts[0]
+        config["qris_number"] = parts[1]
+    else:
+        config["qris_name"]   = parts[0]
+        config["qris_number"] = ""
+    save_payment_config(owner, config)
+    await update.message.reply_text(
+        f"✅ Info QRIS disimpan!\n📱 *{config['qris_name']}* — {config['qris_number']}",
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+async def setting_rekening_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🏦 *Atur Rekening Transfer*\n\nKetik format:\n`NamaBank NomorRek NamaPemilik`\n\nContoh:\n`BRI 123456789012 Siti Rahma`",
+        parse_mode="Markdown"
+    )
+    return SETTING_REKENING
+
+async def setting_rekening_save(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    owner  = update.effective_user.id
+    parts  = update.message.text.strip().split(None, 2)
+    config = get_payment_config(owner)
+    if len(parts) >= 3:
+        config["bank_name"]   = parts[0]
+        config["bank_number"] = parts[1]
+        config["bank_holder"] = parts[2]
+        save_payment_config(owner, config)
+        await update.message.reply_text(
+            f"✅ Rekening disimpan!\n🏦 *{config['bank_name']}* — `{config['bank_number']}`\na/n *{config['bank_holder']}*",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("⚠️ Format salah. Contoh: `BRI 123456789012 Siti Rahma`", parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -769,10 +899,85 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── General Message Handler ───────────────────────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle pesan teks di luar conversation — deteksi pengeluaran via AI."""
     text  = update.message.text.strip()
     owner = update.effective_user.id
 
+    # ── Mode setting pembayaran (dari callback set_qris / set_rekening) ───
+    setting_mode = ctx.user_data.get("setting_mode")
+    if setting_mode == "qris":
+        parts  = text.split(None, 1)
+        config = get_payment_config(owner)
+        config["qris_name"]   = parts[0] if parts else ""
+        config["qris_number"] = parts[1] if len(parts) > 1 else ""
+        save_payment_config(owner, config)
+        ctx.user_data.pop("setting_mode", None)
+        await update.message.reply_text(
+            f"✅ QRIS disimpan!\n📱 *{config['qris_name']}* — `{config['qris_number']}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    if setting_mode == "rekening":
+        parts  = text.split(None, 2)
+        config = get_payment_config(owner)
+        if len(parts) >= 3:
+            config["bank_name"], config["bank_number"], config["bank_holder"] = parts
+            save_payment_config(owner, config)
+            ctx.user_data.pop("setting_mode", None)
+            await update.message.reply_text(
+                f"✅ Rekening disimpan!\n🏦 *{config['bank_name']}* `{config['bank_number']}` a/n *{config['bank_holder']}*",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text("⚠️ Format salah. Contoh: `BRI 123456789012 Siti Rahma`", parse_mode="Markdown")
+        return
+
+    # ── Mode tunggu konfirmasi QRIS/Transfer ──────────────────────────────
+    awaiting = ctx.user_data.get("awaiting")
+    if awaiting == "tunai":
+        # Proses bayar tunai
+        cart  = ctx.user_data.get("cart", [])
+        total = ctx.user_data.get("jual_total", 0)
+        clean = text.replace(".","").replace(",","")
+        try:
+            payment = int(clean)
+        except ValueError:
+            await update.message.reply_text("⚠️ Masukkan angka saja. Contoh: `50000`")
+            return
+        if payment < total:
+            await update.message.reply_text(
+                f"⚠️ Kurang! Total *{fmt_full(total)}*, bayar *{fmt_full(payment)}*.",
+                parse_mode="Markdown"
+            )
+            return
+        sale_id, change = db_create_sale(owner, cart, total, payment, "tunai")
+        ctx.user_data["cart"] = []
+        ctx.user_data.pop("awaiting", None)
+        receipt = make_receipt(sale_id, cart, total, payment, change, "tunai")
+        await update.message.reply_text(receipt, parse_mode="Markdown")
+        return
+
+    if awaiting == "nontunai":
+        method = ctx.user_data.get("pay_method", "transfer")
+        if text.lower() in ["sudah","lunas","ok","oke","ya","done","✅"]:
+            cart    = ctx.user_data.get("cart", [])
+            total   = ctx.user_data.get("jual_total", 0)
+            sale_id, _ = db_create_sale(owner, cart, total, total, method)
+            ctx.user_data["cart"] = []
+            ctx.user_data.pop("awaiting", None)
+            receipt = make_receipt(sale_id, cart, total, total, 0, method)
+            await update.message.reply_text(
+                f"✅ *Pembayaran dikonfirmasi!*\n\n{receipt}", parse_mode="Markdown"
+            )
+        else:
+            method_label = "QRIS" if method == "qris" else "Transfer"
+            await update.message.reply_text(
+                f"Ketik *sudah* setelah pembayaran {method_label} diterima.",
+                parse_mode="Markdown"
+            )
+        return
+
+    # ── Mode normal: parse sebagai pengeluaran ────────────────────────────
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
@@ -790,17 +995,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not parsed.get("success"):
         await update.message.reply_text(
             "🤔 Tidak dipahami sebagai pengeluaran.\n\n"
-            "Contoh pengeluaran: `beli rokok 500rb`, `bayar listrik 200rb`\n"
+            "Contoh: `beli rokok 500rb`, `bayar listrik 200rb`\n"
             "Untuk penjualan gunakan /jual",
             parse_mode="Markdown"
         )
         return
 
     db_add_expense(owner, parsed["amount"], parsed["category"], parsed["description"])
-
-    # Hitung total pengeluaran bulan ini
-    expenses   = db_get_monthly_expenses(owner)
-    total_exp  = sum(e[2] for e in expenses)
+    expenses  = db_get_monthly_expenses(owner)
+    total_exp = sum(e[2] for e in expenses)
 
     await update.message.reply_text(
         f"{parsed.get('reply','✅ Pengeluaran dicatat!')}\n\n"
@@ -827,15 +1030,83 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("cat_"):
         await produk_kategori_callback(update, ctx)
 
+    elif data.startswith("pay_"):
+        method = data.replace("pay_","")
+        cart   = ctx.user_data.get("cart", [])
+        total  = ctx.user_data.get("jual_total", 0)
+        ctx.user_data["pay_method"] = method
+
+        if method == "tunai":
+            await query.edit_message_text(
+                f"{cart_summary(cart)}\n\n"
+                f"💵 *Pembayaran Tunai*\nMasukkan nominal uang yang dibayar:",
+                parse_mode="Markdown"
+            )
+            # Set state ke JUAL_BAYAR_TUNAI via context
+            ctx.user_data["awaiting"] = "tunai"
+
+        elif method == "qris":
+            config = get_payment_config(owner)
+            if not config["qris_number"]:
+                await query.edit_message_text(
+                    "⚠️ Info QRIS belum diset!\nGunakan /setting\_pembayaran untuk mengatur QRIS dulu.",
+                    parse_mode="Markdown"
+                )
+                return
+            await query.edit_message_text(
+                f"📱 *Pembayaran via QRIS*\n\n"
+                f"💰 Total: *{fmt_full(total)}*\n\n"
+                f"Dompet  : *{config['qris_name']}*\n"
+                f"No. HP  : `{config['qris_number']}`\n\n"
+                f"Minta pembeli scan QR / transfer ke nomor di atas.\n"
+                f"Ketik *sudah* setelah pembayaran diterima.",
+                parse_mode="Markdown"
+            )
+            ctx.user_data["awaiting"] = "nontunai"
+
+        elif method == "transfer":
+            config = get_payment_config(owner)
+            if not config["bank_number"]:
+                await query.edit_message_text(
+                    "⚠️ Rekening belum diset!\nGunakan /setting\_pembayaran untuk mengatur rekening dulu.",
+                    parse_mode="Markdown"
+                )
+                return
+            await query.edit_message_text(
+                f"🏦 *Pembayaran via Transfer*\n\n"
+                f"💰 Total: *{fmt_full(total)}*\n\n"
+                f"Bank    : *{config['bank_name']}*\n"
+                f"No. Rek : `{config['bank_number']}`\n"
+                f"a/n     : *{config['bank_holder']}*\n\n"
+                f"Minta pembeli transfer ke rekening di atas.\n"
+                f"Ketik *sudah* setelah pembayaran diterima.",
+                parse_mode="Markdown"
+            )
+            ctx.user_data["awaiting"] = "nontunai"
+
+    elif data == "set_qris":
+        await query.edit_message_text(
+            "📱 *Atur Info QRIS*\n\nKetik format:\n`NamaDompet NomorHP`\n\nContoh:\n`GoPay 081234567890`",
+            parse_mode="Markdown"
+        )
+        ctx.user_data["setting_mode"] = "qris"
+
+    elif data == "set_rekening":
+        await query.edit_message_text(
+            "🏦 *Atur Rekening Transfer*\n\nKetik format:\n`NamaBank NomorRek NamaPemilik`\n\nContoh:\n`BRI 123456789012 Siti Rahma`",
+            parse_mode="Markdown"
+        )
+        ctx.user_data["setting_mode"] = "rekening"
+
     elif data.startswith("exp_"):
         kind = data.replace("exp_","")
         output = io.StringIO()
         writer = csv.writer(output)
 
         if kind == "sales":
-            writer.writerow(["ID","Tanggal","Total","Bayar","Kembalian"])
+            writer.writerow(["ID","Tanggal","Total","Bayar","Kembalian","Metode"])
             for s in db_get_sales(owner):
-                writer.writerow([s[0], s[6], s[2], s[3], s[4]])
+                writer.writerow([s[0], s[6], s[2], s[3], s[4], s[5] if len(s)>5 else "tunai"])
             filename = f"penjualan_{today()}.csv"
             caption  = "🛒 Data Penjualan"
 
@@ -872,8 +1143,20 @@ def main():
     jual_conv = ConversationHandler(
         entry_points=[CommandHandler("jual", cmd_jual)],
         states={
-            JUAL_ITEM:  [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_item)],
-            JUAL_BAYAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_bayar)],
+            JUAL_ITEM:            [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_item)],
+            JUAL_PILIH_BAYAR:     [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_item)],
+            JUAL_BAYAR_TUNAI:     [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_bayar_tunai)],
+            JUAL_KONFIRM_TRANSFER:[MessageHandler(filters.TEXT & ~filters.COMMAND, jual_konfirm_transfer)],
+        },
+        fallbacks=[CommandHandler("batal", jual_cancel)],
+    )
+
+    # ConversationHandler: Setting Pembayaran
+    setting_conv = ConversationHandler(
+        entry_points=[CommandHandler("setting_pembayaran", cmd_setting_pembayaran)],
+        states={
+            SETTING_QRIS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, setting_qris_save)],
+            SETTING_REKENING: [MessageHandler(filters.TEXT & ~filters.COMMAND, setting_rekening_save)],
         },
         fallbacks=[CommandHandler("batal", jual_cancel)],
     )
@@ -907,20 +1190,22 @@ def main():
     app.add_handler(jual_conv)
     app.add_handler(tambah_conv)
     app.add_handler(stok_conv)
+    app.add_handler(setting_conv)
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("bantuan",     cmd_bantuan))
-    app.add_handler(CommandHandler("produk",      cmd_produk))
-    app.add_handler(CommandHandler("cari",        cmd_cari))
-    app.add_handler(CommandHandler("stok",        cmd_stok))
-    app.add_handler(CommandHandler("stok_tipis",  cmd_stok_tipis))
-    app.add_handler(CommandHandler("laporan",     cmd_laporan))
-    app.add_handler(CommandHandler("pengeluaran", cmd_pengeluaran))
-    app.add_handler(CommandHandler("export",      cmd_export))
+    app.add_handler(CommandHandler("start",               cmd_start))
+    app.add_handler(CommandHandler("bantuan",             cmd_bantuan))
+    app.add_handler(CommandHandler("produk",              cmd_produk))
+    app.add_handler(CommandHandler("cari",                cmd_cari))
+    app.add_handler(CommandHandler("stok",                cmd_stok))
+    app.add_handler(CommandHandler("stok_tipis",          cmd_stok_tipis))
+    app.add_handler(CommandHandler("laporan",             cmd_laporan))
+    app.add_handler(CommandHandler("pengeluaran",         cmd_pengeluaran))
+    app.add_handler(CommandHandler("setting_pembayaran",  cmd_setting_pembayaran))
+    app.add_handler(CommandHandler("export",              cmd_export))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🏪 Muslim Kids Store-Gorontalo Bot berjalan...")
+    print("🏪 POS Bot berjalan dengan Gemini AI (GRATIS)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
