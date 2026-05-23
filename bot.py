@@ -699,33 +699,133 @@ async def jual_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── /tambah produk — input satu baris ────────────────────────────────────────
-def ai_parse_produk(text):
-    """Parse input produk satu baris via Gemini AI."""
-    cats = ", ".join(CATEGORIES)
-    prompt = f"""Parse data produk toko berikut. Kembalikan HANYA JSON valid tanpa markdown:
-{{
-  "success": true/false,
-  "name": "nama produk lengkap dengan ukuran jika ada",
-  "price_sell": harga_jual_integer,
-  "price_buy": harga_beli_integer,
-  "stock": stok_integer,
-  "unit": "satuan (pcs/bungkus/botol/kg/renteng/lusin/dll)",
-  "category": "pilih dari [{cats}]",
-  "reason": "alasan jika gagal"
-}}
-Konversi: rb/ribu=x1000, jt/juta=x1000000, k=x1000.
-Urutan data biasanya: nama ukuran harga_jual harga_beli stok satuan
-Jika harga beli tidak ada, perkirakan 80% dari harga jual.
-Jika stok tidak ada, gunakan 0.
-Input: "{text}" """
-    resp = gemini.generate_content(prompt)
+def parse_angka(s):
+    """Konversi string angka ke integer. Contoh: '3.5rb'→3500, '18rb'→18000, '1.5jt'→1500000."""
     import re
-    raw = resp.text.strip()
-    raw = re.sub(r'```json|```', '', raw).strip()
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if match:
-        return json.loads(match.group())
-    return json.loads(raw)
+    s = s.lower().strip().replace(",", ".")
+    try:
+        if "jt" in s or "juta" in s:
+            num = float(re.sub(r'[^\d.]', '', s.replace("juta","").replace("jt","")))
+            return int(num * 1_000_000)
+        if "rb" in s or "ribu" in s:
+            num = float(re.sub(r'[^\d.]', '', s.replace("ribu","").replace("rb","")))
+            return int(num * 1_000)
+        if "k" in s and re.search(r'\d', s):
+            num = float(re.sub(r'[^\d.]', '', s.replace("k","")))
+            return int(num * 1_000)
+        return int(float(re.sub(r'[^\d.]', '', s)))
+    except:
+        return None
+
+SATUAN_LIST = ["pcs","botol","bungkus","kg","gr","gram","ml","liter","l","renteng",
+               "lusin","pak","karton","sachet","lembar","buah","unit","Pcs","Botol",
+               "Bungkus","Kg","Renteng","Lusin"]
+
+def manual_parse_produk(text):
+    """
+    Parse satu baris produk tanpa AI.
+    Format: nama [ukuran] harga_jual [harga_beli] stok satuan
+    Contoh: garam himalaya 100g 3500 2500 10 bungkus
+    """
+    import re
+    tokens = text.strip().split()
+    if len(tokens) < 3:
+        return None
+
+    # 1. Deteksi satuan — biasanya token terakhir
+    unit = "pcs"
+    last = tokens[-1]
+    if last.lower() in [s.lower() for s in SATUAN_LIST] or re.match(r'^[a-zA-Z]+$', last):
+        unit   = last
+        tokens = tokens[:-1]
+
+    # 2. Deteksi angka-angka dari belakang
+    numbers = []
+    name_tokens = []
+    for t in reversed(tokens):
+        val = parse_angka(t)
+        # Anggap angka kalau bisa diparse DAN bukan ukuran (100g, 600ml, 1kg, dll)
+        is_size = bool(re.match(r'^\d+\s*(g|gr|gram|ml|l|liter|kg|mg|oz)$', t.lower()))
+        if val is not None and not is_size:
+            numbers.insert(0, val)
+        else:
+            name_tokens.insert(0, t)
+            # Setelah ketemu non-angka, sisanya nama semua
+            for tt in reversed(list(tokens[:tokens.index(t)])):
+                name_tokens.insert(0, tt)
+            break
+
+    name = " ".join(name_tokens).strip()
+    if not name:
+        return None
+
+    # 3. Tentukan harga & stok dari angka yang ditemukan
+    # Kemungkinan:
+    # [stok]              → 1 angka
+    # [jual, stok]        → 2 angka
+    # [jual, beli, stok]  → 3 angka
+    if len(numbers) == 1:
+        price_sell = 0
+        price_buy  = 0
+        stock      = numbers[0]
+    elif len(numbers) == 2:
+        price_sell = numbers[0]
+        price_buy  = int(price_sell * 0.8)
+        stock      = numbers[1]
+    elif len(numbers) >= 3:
+        price_sell = numbers[0]
+        price_buy  = numbers[1]
+        stock      = numbers[2]
+    else:
+        return None
+
+    # Validasi masuk akal: harga jual > 0
+    if price_sell == 0 and stock > 100_000:
+        # Kemungkinan user hanya tulis harga_jual dan stok, tidak ada harga beli
+        price_sell = stock
+        price_buy  = int(price_sell * 0.8)
+        stock      = 0
+
+    return {
+        "success"   : True,
+        "name"      : name,
+        "price_sell": price_sell,
+        "price_buy" : price_buy,
+        "stock"     : stock,
+        "unit"      : unit,
+        "category"  : "Lainnya",
+        "reason"    : ""
+    }
+
+def ai_parse_produk(text):
+    """Parse input produk — coba manual dulu, fallback ke Gemini AI."""
+    import re
+
+    # ── Coba parser manual dulu (cepat & tidak butuh API) ─────────────────
+    manual = manual_parse_produk(text)
+    if manual and manual["price_sell"] > 0:
+        return manual
+
+    # ── Fallback ke Gemini AI ──────────────────────────────────────────────
+    cats   = ", ".join(CATEGORIES)
+    prompt = f"""Parse data produk toko. Kembalikan HANYA JSON tanpa markdown:
+{{"success":true,"name":"nama lengkap+ukuran","price_sell":integer,"price_buy":integer,"stock":integer,"unit":"satuan","category":"dari [{cats}]","reason":""}}
+Konversi: rb=x1000, jt=x1000000, k=x1000.
+Urutan: nama ukuran harga_jual harga_beli stok satuan.
+Jika harga beli tidak ada → 80% dari harga jual.
+Input: "{text}" """
+    try:
+        resp  = gemini.generate_content(prompt)
+        raw   = resp.text.strip()
+        raw   = re.sub(r'```json|```', '', raw).strip()
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        result = json.loads(match.group() if match else raw)
+        # Pastikan price_buy ada
+        if result.get("success") and not result.get("price_buy"):
+            result["price_buy"] = int(result.get("price_sell", 0) * 0.8)
+        return result
+    except Exception:
+        return {"success": False, "reason": "Gagal memparse. Coba format: nama harga_jual harga_beli stok satuan"}
 
 async def cmd_tambah(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Tampilkan panduan input satu baris."""
@@ -760,8 +860,7 @@ async def produk_nama(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📦 Masukkan *nama produk*:", parse_mode="Markdown")
         return PRODUK_HARGA_JUAL  # pakai state berbeda untuk wizard
 
-    # Mode satu baris — parse via AI
-    await update.message.reply_text("⏳ Memproses...", parse_mode="Markdown")
+    # Mode satu baris — parse (manual dulu, AI kalau perlu)
     try:
         parsed = ai_parse_produk(text)
     except Exception:
