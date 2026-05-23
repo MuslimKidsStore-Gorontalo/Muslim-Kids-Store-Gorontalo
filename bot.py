@@ -413,6 +413,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🛒 /jual — Catat penjualan\n"
         "🧺 /keranjang — Lanjutkan keranjang tersimpan\n"
         "📦 /produk — Kelola produk\n"
+        "✏️ /edit — Edit produk\n"
         "📊 /laporan — Laporan & omzet\n"
         "📉 /stok — Cek & update stok\n"
         "💸 /pengeluaran — Catat pengeluaran\n"
@@ -1111,6 +1112,75 @@ async def cmd_cari(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Edit produk. Contoh: /edit indomie atau /edit 3"""
+    owner   = update.effective_user.id
+    keyword = " ".join(ctx.args) if ctx.args else ""
+
+    if not keyword:
+        await update.message.reply_text(
+            "✏️ *Edit Produk*\n\n"
+            "Ketik nama atau ID produk:\n"
+            "`/edit indomie goreng`\n"
+            "`/edit 5`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Cari berdasarkan ID atau nama
+    prod = None
+    if keyword.lstrip("#").isdigit():
+        prod = db_get_product(owner, int(keyword.lstrip("#")))
+    else:
+        results = db_search_products(owner, keyword)
+        if len(results) == 1:
+            prod = results[0]
+        elif len(results) > 1:
+            # Tampilkan pilihan
+            keyboard = [[InlineKeyboardButton(
+                f"#{p[0]} {p[2]} — {fmt_rp(p[3])}",
+                callback_data=f"edit_sel_{p[0]}"
+            )] for p in results[:8]]
+            await update.message.reply_text(
+                f"🔍 Ditemukan *{len(results)} produk*. Pilih yang ingin diedit:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+
+    if not prod:
+        await update.message.reply_text(f"❌ Produk '{keyword}' tidak ditemukan.\nCoba `/cari {keyword}`", parse_mode="Markdown")
+        return
+
+    await show_edit_menu(update.message.reply_text, prod)
+
+async def show_edit_menu(send_fn, prod):
+    """Tampilkan menu edit field produk."""
+    margin = prod[3] - prod[4]
+    keyboard = [
+        [InlineKeyboardButton("📝 Nama",        callback_data=f"edit_field_{prod[0]}_name"),
+         InlineKeyboardButton("🏷️ Kategori",    callback_data=f"edit_field_{prod[0]}_category")],
+        [InlineKeyboardButton("💰 Harga Jual",   callback_data=f"edit_field_{prod[0]}_price_sell"),
+         InlineKeyboardButton("💸 Harga Beli",   callback_data=f"edit_field_{prod[0]}_price_buy")],
+        [InlineKeyboardButton("📊 Stok",         callback_data=f"edit_field_{prod[0]}_stock"),
+         InlineKeyboardButton("📏 Satuan",       callback_data=f"edit_field_{prod[0]}_unit")],
+        [InlineKeyboardButton("⚠️ Min Stok",     callback_data=f"edit_field_{prod[0]}_min_stock")],
+        [InlineKeyboardButton("🗑️ Hapus Produk", callback_data=f"edit_hapus_{prod[0]}")],
+    ]
+    await send_fn(
+        f"✏️ *Edit Produk #{prod[0]}*\n\n"
+        f"📦 Nama   : *{prod[2]}*\n"
+        f"🏷️ Kategori: {prod[8]} {CAT_EMOJI.get(prod[8],'')}\n"
+        f"💰 Jual   : {fmt_full(prod[3])}\n"
+        f"💸 Beli   : {fmt_full(prod[4])}\n"
+        f"📈 Margin : {fmt_full(margin)}\n"
+        f"📊 Stok   : {prod[5]} {prod[7]} (min: {prod[6]})\n\n"
+        f"Pilih yang ingin diubah:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
 # ── /stok ─────────────────────────────────────────────────────────────────────
 async def cmd_stok(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     owner    = update.effective_user.id
@@ -1316,7 +1386,45 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text  = update.message.text.strip()
     owner = update.effective_user.id
 
-    # ── Mode setting pembayaran (dari callback set_qris / set_rekening) ───
+    # ── Mode edit produk ──────────────────────────────────────────────────
+    if ctx.user_data.get("edit_mode"):
+        pid   = ctx.user_data.get("edit_pid")
+        field = ctx.user_data.get("edit_field")
+        val   = text.strip()
+
+        field_labels = {
+            "name": "Nama", "price_sell": "Harga Jual",
+            "price_buy": "Harga Beli", "stock": "Stok",
+            "min_stock": "Min Stok", "unit": "Satuan",
+        }
+
+        # Konversi angka jika perlu
+        if field in ["price_sell","price_buy","stock","min_stock"]:
+            parsed_val = parse_angka(val)
+            if parsed_val is None:
+                await update.message.reply_text("⚠️ Masukkan angka saja. Contoh: `3500` atau `3.5rb`", parse_mode="Markdown")
+                return
+            val = parsed_val
+
+        db_update_product(pid, field, val)
+        prod = db_get_product(owner, pid)
+        ctx.user_data.pop("edit_mode", None)
+        ctx.user_data.pop("edit_pid",  None)
+        ctx.user_data.pop("edit_field",None)
+
+        margin = prod[3] - prod[4]
+        keyboard = [[InlineKeyboardButton("✏️ Edit lagi", callback_data=f"edit_sel_{pid}")]]
+        await update.message.reply_text(
+            f"✅ *{field_labels.get(field, field)}* berhasil diubah!\n\n"
+            f"📦 *{prod[2]}*\n"
+            f"💰 Jual : {fmt_full(prod[3])}\n"
+            f"💸 Beli : {fmt_full(prod[4])}\n"
+            f"📈 Margin: {fmt_full(margin)}\n"
+            f"📊 Stok : {prod[5]} {prod[7]}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
     setting_mode = ctx.user_data.get("setting_mode")
     if setting_mode == "qris":
         parts  = text.split(None, 1)
@@ -1523,6 +1631,104 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data.pop("saved_cart_temp", None)
             await query.edit_message_text("🗑️ Keranjang berhasil dihapus.")
 
+    elif data.startswith("edit_sel_"):
+        # Pilih produk dari hasil pencarian
+        pid  = int(data.replace("edit_sel_",""))
+        prod = db_get_product(owner, pid)
+        if prod:
+            await show_edit_menu(query.edit_message_text, prod)
+
+    elif data.startswith("edit_hapus_"):
+        pid  = int(data.replace("edit_hapus_",""))
+        prod = db_get_product(owner, pid)
+        if prod:
+            keyboard = [[
+                InlineKeyboardButton("✅ Ya, hapus!", callback_data=f"edit_konfirm_hapus_{pid}"),
+                InlineKeyboardButton("❌ Batal",      callback_data=f"edit_sel_{pid}"),
+            ]]
+            await query.edit_message_text(
+                f"⚠️ *Yakin hapus produk?*\n\n"
+                f"📦 *{prod[2]}*\n"
+                f"Stok: {prod[5]} {prod[7]}\n\n"
+                f"Data produk akan dihapus permanen!",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+    elif data.startswith("edit_konfirm_hapus_"):
+        pid = int(data.replace("edit_konfirm_hapus_",""))
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute("DELETE FROM products WHERE id=? AND owner_id=?", (pid, owner))
+        await query.edit_message_text("🗑️ Produk berhasil dihapus.")
+
+    elif data.startswith("edit_field_"):
+        # Format: edit_field_{pid}_{field}
+        parts = data.split("_")
+        pid   = int(parts[2])
+        field = "_".join(parts[3:])
+        prod  = db_get_product(owner, pid)
+        if not prod:
+            await query.edit_message_text("❌ Produk tidak ditemukan.")
+            return
+
+        # Simpan konteks edit
+        ctx.user_data["edit_pid"]   = pid
+        ctx.user_data["edit_field"] = field
+
+        field_labels = {
+            "name"      : "Nama produk",
+            "price_sell": "Harga jual (contoh: 3500 atau 3.5rb)",
+            "price_buy" : "Harga beli/modal (contoh: 2800)",
+            "stock"     : "Stok baru (angka)",
+            "min_stock" : "Minimum stok alert (angka)",
+            "unit"      : "Satuan (pcs/botol/bungkus/kg/dll)",
+            "category"  : "Pilih kategori baru",
+        }
+
+        if field == "category":
+            # Tampilkan tombol kategori
+            cats     = [CATEGORIES[i:i+3] for i in range(0, len(CATEGORIES), 3)]
+            keyboard = [[InlineKeyboardButton(
+                f"{CAT_EMOJI[c]} {c}", callback_data=f"edit_cat_{pid}_{c}"
+            ) for c in row] for row in cats]
+            keyboard.append([InlineKeyboardButton("❌ Batal", callback_data=f"edit_sel_{pid}")])
+            await query.edit_message_text(
+                f"🏷️ Pilih kategori baru untuk *{prod[2]}*:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            current_val = {
+                "name"      : prod[2],
+                "price_sell": fmt_full(prod[3]),
+                "price_buy" : fmt_full(prod[4]),
+                "stock"     : f"{prod[5]} {prod[7]}",
+                "min_stock" : str(prod[6]),
+                "unit"      : prod[7],
+            }.get(field, "-")
+
+            await query.edit_message_text(
+                f"✏️ *Ubah {field_labels.get(field, field)}*\n\n"
+                f"Produk  : *{prod[2]}*\n"
+                f"Nilai saat ini: `{current_val}`\n\n"
+                f"Ketik nilai baru:",
+                parse_mode="Markdown"
+            )
+            ctx.user_data["edit_mode"] = True
+
+    elif data.startswith("edit_cat_"):
+        # Simpan kategori baru
+        parts    = data.split("_", 3)
+        pid      = int(parts[2])
+        category = parts[3]
+        db_update_product(pid, "category", category)
+        prod = db_get_product(owner, pid)
+        await query.edit_message_text(
+            f"✅ Kategori *{prod[2]}* diubah ke *{category}* {CAT_EMOJI.get(category,'')}",
+            parse_mode="Markdown"
+        )
+        ctx.user_data.pop("edit_mode", None)
+
     elif data.startswith("cat_"):
         await produk_kategori_callback(update, ctx)
 
@@ -1708,6 +1914,7 @@ def main():
     app.add_handler(CommandHandler("keranjang",           cmd_keranjang))
     app.add_handler(CommandHandler("produk",              cmd_produk))
     app.add_handler(CommandHandler("cari",                cmd_cari))
+    app.add_handler(CommandHandler("edit",                cmd_edit))
     app.add_handler(CommandHandler("stok",                cmd_stok))
     app.add_handler(CommandHandler("stok_tipis",          cmd_stok_tipis))
     app.add_handler(CommandHandler("laporan",             cmd_laporan))
