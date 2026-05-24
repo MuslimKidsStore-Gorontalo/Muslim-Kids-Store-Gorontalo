@@ -17,11 +17,21 @@ from telegram.ext import (
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-# ── Persistent storage — data tidak hilang saat redeploy ─────────────────────
-# Render Persistent Disk mount di /data
-# Lokal (development) tetap pakai folder saat ini
-DATA_DIR = pathlib.Path("/data") if pathlib.Path("/data").exists() else pathlib.Path(".")
-DB_PATH  = str(DATA_DIR / "pos_toko.db")
+# ── Persistent storage — data tidak hilang saat update bot.py ────────────────
+# Prioritas folder penyimpanan:
+# 1. /opt/pos-data  → VPS Indonesia (Niagahoster, Domainesia, dll)
+# 2. /data          → Render Persistent Disk
+# 3. .              → Lokal / development
+for _dir in ["/opt/pos-data", "/data", "."]:
+    _path = pathlib.Path(_dir)
+    if _path.exists() and _dir != ".":
+        DATA_DIR = _path
+        break
+    elif _dir == ".":
+        DATA_DIR = _path
+
+DB_PATH = str(DATA_DIR / "pos_toko.db")
+print(f"📁 Database tersimpan di: {DB_PATH}")
 
 genai.configure(api_key=GEMINI_API_KEY)
 gemini = genai.GenerativeModel(
