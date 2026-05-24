@@ -1851,35 +1851,7 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # ConversationHandler: Jual
-    jual_conv = ConversationHandler(
-        entry_points=[CommandHandler("jual", cmd_jual)],
-        states={
-            JUAL_ITEM:        [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_item)],
-            JUAL_PILIH_BAYAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_router)],
-        },
-        fallbacks=[
-            CommandHandler("batal", jual_cancel),
-            CommandHandler("start", cmd_start),
-        ],
-        allow_reentry=True,
-    )
-
-    # ConversationHandler: Setting Pembayaran
-    setting_conv = ConversationHandler(
-        entry_points=[CommandHandler("setting_pembayaran", cmd_setting_pembayaran)],
-        states={
-            SETTING_QRIS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, setting_qris_save)],
-            SETTING_REKENING: [MessageHandler(filters.TEXT & ~filters.COMMAND, setting_rekening_save)],
-        },
-        fallbacks=[
-            CommandHandler("batal", jual_cancel),
-            CommandHandler("start", cmd_start),
-        ],
-        allow_reentry=True,
-    )
-
-    # ConversationHandler: Tambah Produk
+    # ConversationHandler: Tambah Produk — didaftarkan PERTAMA agar prioritas lebih tinggi
     tambah_conv = ConversationHandler(
         entry_points=[CommandHandler("tambah", cmd_tambah)],
         states={
@@ -1891,6 +1863,36 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, produk_satuan),
                 CallbackQueryHandler(produk_kategori_callback, pattern="^cat_"),
             ],
+        },
+        fallbacks=[
+            CommandHandler("batal", jual_cancel),
+            CommandHandler("jual",  cmd_jual),
+            CommandHandler("start", cmd_start),
+        ],
+        allow_reentry=True,
+    )
+
+    # ConversationHandler: Jual
+    jual_conv = ConversationHandler(
+        entry_points=[CommandHandler("jual", cmd_jual)],
+        states={
+            JUAL_ITEM:        [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_item)],
+            JUAL_PILIH_BAYAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, jual_router)],
+        },
+        fallbacks=[
+            CommandHandler("batal",  jual_cancel),
+            CommandHandler("tambah", cmd_tambah),
+            CommandHandler("start",  cmd_start),
+        ],
+        allow_reentry=True,
+    )
+
+    # ConversationHandler: Setting Pembayaran
+    setting_conv = ConversationHandler(
+        entry_points=[CommandHandler("setting_pembayaran", cmd_setting_pembayaran)],
+        states={
+            SETTING_QRIS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, setting_qris_save)],
+            SETTING_REKENING: [MessageHandler(filters.TEXT & ~filters.COMMAND, setting_rekening_save)],
         },
         fallbacks=[
             CommandHandler("batal", jual_cancel),
@@ -1913,8 +1915,9 @@ def main():
         allow_reentry=True,
     )
 
-    app.add_handler(jual_conv)
+    # ⚠️ Urutan pendaftaran penting! tambah_conv harus sebelum jual_conv
     app.add_handler(tambah_conv)
+    app.add_handler(jual_conv)
     app.add_handler(stok_conv)
     app.add_handler(setting_conv)
 
